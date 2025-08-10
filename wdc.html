@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Generic JSON WDC</title>
+  <script src="https://connectors.tableau.com/libs/tableauwdc-2.3.latest.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    input { width: 80%; padding: 8px; margin: 5px 0; }
+    button { padding: 8px 16px; }
+  </style>
+</head>
+<body>
+  <h2>Generic JSON → Tableau WDC</h2>
+  <p>JSON API URL’inizi girin:</p>
+  <input type="text" id="apiUrl" placeholder="https://..." />
+  <br>
+  <button onclick="submitWDC()">Veriyi Çek</button>
+
+  <script>
+    const myConnector = tableau.makeConnector();
+
+    myConnector.getSchema = function (schemaCallback) {
+      const apiUrl = tableau.connectionData;
+      fetch(apiUrl)
+        .then(res => res.json())
+        .then(data => {
+          if (!data || !data.result || !data.result.records || data.result.records.length === 0) {
+            alert("Veri bulunamadı veya format hatalı");
+            schemaCallback([]);
+            return;
+          }
+          const firstRecord = data.result.records[0];
+          const cols = Object.keys(firstRecord).map(key => ({
+            id: key,
+            dataType: tableau.dataTypeEnum.string
+          }));
+          schemaCallback([{
+            id: "genericJson",
+            alias: "Generic JSON Data",
+            columns: cols
+          }]);
+        })
+        .catch(err => {
+          console.error("Schema error:", err);
+          schemaCallback([]);
+        });
+    };
+
+    myConnector.getData = function (table, doneCallback) {
+      const apiUrl = tableau.connectionData;
+      fetch(apiUrl)
+        .then(res => res.json())
+        .then(data => {
+          const records = data.result.records;
+          table.appendRows(records);
+          doneCallback();
+        })
+        .catch(err => {
+          console.error("Data fetch error:", err);
+          doneCallback();
+        });
+    };
+
+    tableau.registerConnector(myConnector);
+
+    function submitWDC() {
+      const apiUrl = document.getElementById("apiUrl").value.trim();
+      if (!apiUrl) {
+        alert("Lütfen bir JSON API URL girin.");
+        return;
+      }
+      tableau.connectionData = apiUrl;
+      tableau.connectionName = "Generic JSON WDC";
+      tableau.submit();
+    }
+  </script>
+</body>
+</html>
