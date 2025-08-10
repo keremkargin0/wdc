@@ -2,111 +2,99 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Generic CKAN JSON WDC (CORS-safe)</title>
+  <title>Generic JSON/CKAN WDC (no popups)</title>
   <script src="https://connectors.tableau.com/libs/tableauwdc-2.3.latest.js"></script>
   <style>body{font-family:system-ui,Arial;margin:20px}input{width:80%;padding:8px}button{padding:8px 14px;margin-left:8px}</style>
 </head>
 <body>
-  <h2>CKAN / İBB JSON → Tableau (JSONP fallback)</h2>
-  <p>CKAN <code>datastore_search</code> URL’ini gir:</p>
-  <input id="apiUrl" placeholder="https://data.ibb.gov.tr/api/3/action/datastore_search?resource_id=...&limit=100">
+  <h2>JSON / CKAN → Tableau (CORS varsa fetch, yoksa CKAN JSONP)</h2>
+  <p>Herhangi bir JSON API URL’i (CKAN veya düz JSON):</p>
+  <input id="apiUrl" placeholder="https://...">
   <button onclick="submitWDC()">Veriyi Çek</button>
 
 <script>
-  // --- JSONP yardımcıları ---
-  function jsonp(url, cbName = "__wdcCb_"+Math.random().toString(36).slice(2), timeoutMs=15000){
+  // JSONP sadece CKAN datastore_search için denenir
+  function jsonp(url, cbName = "__wdcCb_"+Math.random().toString(36).slice(2), timeoutMs=12000){
     return new Promise((resolve, reject) => {
       const s = document.createElement('script');
       const sep = url.includes('?') ? '&' : '?';
       const full = url + sep + 'callback=' + cbName;
-      let timeout = setTimeout(() => {
-        cleanup();
-        reject(new Error('JSONP timeout'));
-      }, timeoutMs);
-      function cleanup(){
-        clearTimeout(timeout);
-        delete window[cbName];
-        s.remove();
-      }
-      window[cbName] = (data) => { cleanup(); resolve(data); };
+      const timer = setTimeout(()=>{ cleanup(); reject(new Error('JSONP timeout')); }, timeoutMs);
+      function cleanup(){ clearTimeout(timer); delete window[cbName]; s.remove(); }
+      window[cbName] = (data)=>{ cleanup(); resolve(data); };
       s.src = full;
-      s.onerror = () => { cleanup(); reject(new Error('JSONP load error')); };
+      s.onerror = ()=>{ cleanup(); reject(new Error('JSONP load error')); };
       document.body.appendChild(s);
     });
   }
 
-  async function getCkan(url){
-    // fetch ile dene; CORS kırılırsa JSONP’ye düş
+  async function getJson(url){
+    // önce normal fetch dene (CORS açıksa çalışır)
     try{
-      const res = await fetch(url, {cache:'no-store'});
-      if(!res.ok) throw new Error('HTTP '+res.status);
-      return await res.json();
-    }catch(_){
-      // JSONP fallback
-      return await jsonp(url);
+      const r = await fetch(url, {cache:'no-store'});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      return await r.json();
+    }catch(e){
+      // CKAN mı? o zaman JSONP dene
+      if (/\/api\/3\/action\/datastore_search/.test(url)) {
+        return await jsonp(url);
+      }
+      // CKAN değilse ve fetch başarısızsa: CORS yüzünden proxy olmadan mümkün değil
+      throw e;
     }
   }
 
-  function mapCkanType(t){
-    t = (t||'').toLowerCase();
-    if (['int','integer'].includes(t)) return tableau.dataTypeEnum.int;
-    if (['float','double','number','numeric','money'].includes(t)) return tableau.dataTypeEnum.float;
-    if (['bool','boolean'].includes(t)) return tableau.dataTypeEnum.bool;
-    if (['date'].includes(t)) return tableau.dataTypeEnum.date;
-    if (['timestamp','datetime','time'].includes(t)) return tableau.dataTypeEnum.datetime;
-    return tableau.dataTypeEnum.string;
+  function toTableRows(data){
+    // 1) CKAN: result.records
+    if (data && data.result && Array.isArray(data.result.records)) return data.result.records;
+
+    // 2) Kökte Dizi
+    if (Array.isArray(data)) return data;
+
+    // 3) Nesne içinde dizi ara (ilk bulunan dizi)
+    if (data && typeof data === 'object'){
+      for (const k of Object.keys(data)){
+        if (Array.isArray(data[k])) return data[k];
+      }
+    }
+    return [];
   }
 
-  // --- WDC ---
+  function inferColumns(rows){
+    const sample = rows[0] || {};
+    return Object.keys(sample).map(k => ({ id:k, dataType: tableau.dataTypeEnum.string }));
+  }
+
   const connector = tableau.makeConnector();
 
   connector.getSchema = async function(schemaCallback){
     try{
-      const cfg = JSON.parse(tableau.connectionData || '{}');
-      let url = cfg.baseUrl || '';
-      if (!url) throw new Error('URL yok');
-      // hızlı şema almak için min limit ekle
-      if (!/[\?&]limit=/.test(url)) url += (url.includes('?')?'&':'?')+'limit=1';
-      const data = await getCkan(url);
-      const res = data && data.result;
-      const fields = (res && res.fields) ? res.fields : [];
-      let cols = [];
-      if (fields.length){
-        cols = fields.map(f => ({ id: f.id, alias: f.id, dataType: mapCkanType(f.type) }));
-      } else if (res && res.records && res.records[0]) {
-        cols = Object.keys(res.records[0]).map(k => ({ id:k, dataType: tableau.dataTypeEnum.string }));
+      const cfg = JSON.parse(tableau.connectionData||'{}');
+      const url = cfg.baseUrl;
+      const data = await getJson(url);
+      const rows = toTableRows(data);
+      let cols;
+      if (data && data.result && Array.isArray(data.result.fields) && data.result.fields.length){
+        // CKAN alanları
+        cols = data.result.fields.map(f => ({ id:f.id, dataType: tableau.dataTypeEnum.string }));
       } else {
-        // son çare: en az bir kolon ver, Tableau boş şema hatası atmasın
-        cols = [{ id:'_id', dataType: tableau.dataTypeEnum.string }];
+        cols = inferColumns(rows);
       }
-      schemaCallback([{ id:'ckanData', alias:'CKAN Dataset', columns: cols }]);
+      if (!cols.length) cols = [{ id:'_dummy', dataType: tableau.dataTypeEnum.string }];
+      schemaCallback([{ id:'data', alias:'JSON Data', columns: cols }]);
     }catch(e){
-      // yine de boş dönmeyelim
-      schemaCallback([{ id:'ckanData', alias:'CKAN Dataset (fallback)', columns:[{id:'_id', dataType: tableau.dataTypeEnum.string}] }]);
+      // yine de boş şema döndürmeyelim
+      schemaCallback([{ id:'data', alias:'JSON Data (fallback)', columns:[{id:'_dummy', dataType: tableau.dataTypeEnum.string}] }]);
     }
   };
 
   connector.getData = async function(table, doneCallback){
     try{
-      const cfg = JSON.parse(tableau.connectionData || '{}');
-      let base = cfg.baseUrl || '';
-      const pageSize = cfg.pageSize || 500;
-      let offset = 0, more = true;
-      // en azından bir limit olsun
-      if (!/[\?&]limit=/.test(base)) base += (base.includes('?')?'&':'?')+'limit='+pageSize;
-
-      while(more){
-        const url = base + (base.includes('?')?'&':'?') + 'offset=' + offset;
-        const data = await getCkan(url);
-        const recs = (data && data.result && data.result.records) ? data.result.records : [];
-        if (recs.length){
-          table.appendRows(recs);
-          more = recs.length === pageSize; // sayfa dolmuşsa devam
-          offset += pageSize;
-        } else {
-          more = false;
-        }
-      }
+      const cfg = JSON.parse(tableau.connectionData||'{}');
+      const url = cfg.baseUrl;
+      const data = await getJson(url);
+      const rows = toTableRows(data);
+      if (rows.length) table.appendRows(rows);
       doneCallback();
     }catch(e){
       doneCallback();
@@ -116,14 +104,10 @@
   tableau.registerConnector(connector);
 
   function submitWDC(){
-    let u = document.getElementById('apiUrl').value.trim();
-    if(!u){ alert('URL gir'); return; }
-    // güvenlik: sadece CKAN action endpoint beklensin
-    if (!/\/api\/3\/action\/datastore_search/.test(u)){
-      if(!confirm('Bu bir CKAN datastore_search URL’i gibi görünmüyor. Yine de devam edilsin mi?')) return;
-    }
-    tableau.connectionName = 'CKAN/İBB JSON (JSONP fallback)';
-    tableau.connectionData  = JSON.stringify({ baseUrl: u, pageSize: 500 });
+    const u = document.getElementById('apiUrl').value.trim();
+    if(!u){ alert('URL girin'); return; }
+    tableau.connectionName = 'Generic JSON/CKAN';
+    tableau.connectionData  = JSON.stringify({ baseUrl: u });
     tableau.submit();
   }
 </script>
